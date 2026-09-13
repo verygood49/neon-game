@@ -10,7 +10,9 @@ source.include_patterns = assets/*.png, assets/fonts/*.ttf
 
 version = 1.0
 
-requirements = python3==3.14.2,kivy==2.3.1
+requirements = python3==3.11.9,kivy==2.3.1
+
+p4a.branch = develop
 
 orientation = portrait
 fullscreen = 1
