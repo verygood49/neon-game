@@ -10,7 +10,7 @@ source.include_patterns = assets/*.png, assets/fonts/*.ttf
 
 version = 1.0
 
-requirements = python3==1.12.10,kivy
+requirements = python3==3.12.10,kivy
 
 orientation = portrait
 fullscreen = 1
