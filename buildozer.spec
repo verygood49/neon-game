@@ -10,7 +10,7 @@ source.include_patterns = assets/*.png, assets/fonts/*.ttf
 
 version = 1.0
 
-requirements = python3,kivy,pillow
+requirements = python3,kivy
 
 orientation = portrait
 fullscreen = 1
@@ -26,7 +26,7 @@ icon.filename = %(source.dir)s/assets/icon.png
 android.api = 33
 android.minapi = 24
 android.ndk = 25b
-android.archs = arm64-v8a, armeabi-v7a
+android.archs = arm64-v8a
 android.allow_backup = True
 android.accept_sdk_license = True
 android.enable_androidx = True
