@@ -12,7 +12,7 @@ version = 1.0
 
 requirements = python3==3.11.9,kivy==2.3.1
 
-p4a.branch = develop
+p4a.branch = v2023.09.10
 
 orientation = portrait
 fullscreen = 1
