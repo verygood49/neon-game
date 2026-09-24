@@ -14,7 +14,7 @@ requirements = python3,kivy==2.3.1,filetype
 
 p4a.branch = v2024.01.21
 
-orientation = portrait
+orientation = landscape
 fullscreen = 1
 
 # 图标和启动图

@@ -83,6 +83,7 @@ class GameWidget(Widget):
 
         Clock.schedule_once(self._try_init, 0)
         Clock.schedule_interval(self._tick, 1 / 60)
+        self.pause_btn_rect = None
 
     # ---------------- 初始化 ----------------
     def _try_init(self, dt):
@@ -160,6 +161,22 @@ class GameWidget(Widget):
         if self.state == 'over':
             self.init_game()
             return True
+
+        # 检测暂停按钮点击
+        if self.pause_btn_rect:
+            x, y, w, h = self.pause_btn_rect
+            if x <= touch.x <= x + w and y <= touch.y <= y + h:
+                if self.state == 'playing':
+                    self.state = 'paused'
+                elif self.state == 'paused':
+                    self.state = 'playing'
+                return True
+
+        # 暂停状态下点击任意位置恢复
+        if self.state == 'paused':
+            self.state = 'playing'
+            return True
+
         self.touch_x = touch.x
         return True
 
@@ -945,13 +962,49 @@ class GameWidget(Widget):
                             '#ffffff', int(24 * S) or 16, 'center')
             self._draw_text("TAP TO RESTART", W / 2, H / 2 - 60 * S,
                             '#5ee8ff', int(18 * S) or 13, 'center')
+        # 绘制暂停按钮（右上角）
+        btn_size = 40 * S
+        btn_x = W - btn_size - 800 * S
+        btn_y = H - btn_size - 10 * S
+        self.pause_btn_rect = (btn_x, btn_y, btn_size, btn_size)
+
+        Color(*hex_rgba('#2a2a3a'))
+        Rectangle(pos=(btn_x, btn_y), size=(btn_size, btn_size))
+        Color(*hex_rgba('#5ee8ff'))
+        Line(rectangle=(btn_x, btn_y, btn_size, btn_size), width=2)
+
+        if self.state == 'playing':
+            # 暂停图标：两条竖线
+            bar_w = btn_size * 0.2
+            bar_h = btn_size * 0.5
+            Color(*hex_rgba('#5ee8ff'))
+            Rectangle(pos=(btn_x + btn_size*0.3, btn_y + btn_size*0.25), size=(bar_w, bar_h))
+            Rectangle(pos=(btn_x + btn_size*0.5, btn_y + btn_size*0.25), size=(bar_w, bar_h))
+        else:
+            # 播放图标：三角形
+            pts = [btn_x + btn_size*0.35, btn_y + btn_size*0.25,
+                   btn_x + btn_size*0.35, btn_y + btn_size*0.75,
+                   btn_x + btn_size*0.7, btn_y + btn_size*0.5]
+            Color(*hex_rgba('#5ee8ff'))
+            Line(points=pts, close=True, width=2)
 
 
 class NeonApp(App):
     def build(self):
         self.title = "Neon Annihilator"
         Window.clearcolor = (0.02, 0.02, 0.06, 1)
-        return GameWidget()
+        self.game = GameWidget()
+        return self.game
+
+    def on_pause(self):
+        # 进入后台时暂停游戏
+        if self.game.state == 'playing':
+            self.game.state = 'paused'
+        return True  # 允许应用暂停
+
+    def on_resume(self):
+        # 回到前台，保持暂停，用户点击后继续
+        pass
 
 
 if __name__ == '__main__':
