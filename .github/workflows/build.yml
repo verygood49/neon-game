@@ -1,5 +1,7 @@
 name: Build APK
-
+run: |
+   buildozer android clean
+   buildozer -v android debug
 on:
   push:
     branches: [ main ]
@@ -51,6 +53,20 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install buildozer cython==0.29.36
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libtool \
+            libtool-bin \
+            libltdl-dev \
+            automake \
+            autoconf \
+            pkg-config \
+            cmake \
+            zip \
+            unzip
 
       - name: Build with Buildozer
         run: |
