@@ -10,7 +10,7 @@ source.include_patterns = assets/*.png, assets/fonts/*.ttf
 
 version = 1.0
 
-requirements = python3==3.11.9,kivy==2.3.1
+requirements = python3==3.12.10,kivy==2.3.1
 
 p4a.branch = v2024.01.21
 
