@@ -2,6 +2,8 @@ import os
 import sys
 import math
 import random
+import threading
+import collections
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -11,7 +13,9 @@ from kivy.core.text import Label as CoreLabel, LabelBase
 from kivy.graphics import Color, Ellipse, Line, Rectangle
 from kivy.uix.widget import Widget
 
+
 # ---------- 资源路径 ----------
+CACHE_VER = 'v3'
 def resource_path(rel):
     if hasattr(sys, '_MEIPASS'):
         base = sys._MEIPASS
@@ -23,7 +27,6 @@ def resource_path(rel):
 ASSET_DIR = resource_path('assets')
 FONT_NAME = 'Roboto'
 
-# 中文字体（可选）：把任意中文字体放到 assets/fonts/main.ttf 即可
 _font_path = os.path.join(ASSET_DIR, 'fonts', 'main.ttf')
 if os.path.exists(_font_path):
     LabelBase.register(name='CJK', fn_regular=_font_path)
@@ -33,6 +36,9 @@ IMG_NAMES = [
     'player', 'enemy_scout', 'enemy_gunner', 'enemy_raider',
     'boss', 'pu_triple', 'pu_shield', 'pu_life',
 ]
+
+# 贴图最大边长，超过则降采样（大幅降低显存 / 上传耗时）
+MAX_TEX_SIZE = 512
 
 
 def hex_rgba(h, a=1.0):
@@ -55,39 +61,227 @@ def poly_pts(cx, cy, r, sides, rot=0):
     return pts
 
 
+# ---------- 图片处理 ----------
+try:
+    from PIL import Image as PILImage
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    import numpy as _np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+
+
+def _bg_is_black(img, threshold=40, ratio=0.5):
+    """采样图片四条边，看是否大部分是黑（或已经透明）"""
+    w, h = img.size
+    px = img.load()
+    samples = []
+    sx = max(1, w // 32)
+    sy = max(1, h // 32)
+    for x in range(0, w, sx):
+        samples.append(px[x, 0])
+        samples.append(px[x, h - 1])
+    for y in range(0, h, sy):
+        samples.append(px[0, y])
+        samples.append(px[w - 1, y])
+
+    dark = 0
+    for r, g, b, a in samples:
+        if a == 0 or (r < threshold and g < threshold and b < threshold):
+            dark += 1
+    return dark >= len(samples) * ratio
+
+def _clean_black_flood(img, threshold=40):
+    """
+    从图片四个边缘开始泛洪，只清除与边缘连通的黑色区域。
+    这样可以完美保留角色内部（如飞船驾驶舱）的黑色细节。
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+    px = img.load()
+    
+    visited = [[False] * w for _ in range(h)]
+    queue = collections.deque()
+
+    def is_dark(x, y):
+        r, g, b, a = px[x, y]
+        return a > 0 and r < threshold and g < threshold and b < threshold
+
+    # 1. 将四个边缘的黑色像素加入队列
+    for x in range(w):
+        if is_dark(x, 0):
+            queue.append((x, 0)); visited[0][x] = True
+        if is_dark(x, h - 1):
+            queue.append((x, h - 1)); visited[h - 1][x] = True
+    for y in range(h):
+        if is_dark(0, y):
+            queue.append((0, y)); visited[y][0] = True
+        if is_dark(w - 1, y):
+            queue.append((w - 1, y)); visited[y][w - 1] = True
+
+    # 2. BFS 泛洪
+    while queue:
+        cx, cy = queue.popleft()
+        px[cx, cy] = (0, 0, 0, 0)  # 变透明
+
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h and not visited[ny][nx]:
+                if is_dark(nx, ny):
+                    visited[ny][nx] = True
+                    queue.append((nx, ny))
+    return img
+
+
+def _get_cache_dir():
+    """注意：应在主线程调用一次后缓存结果，避免线程里访问 App。"""
+    try:
+        app = App.get_running_app()
+        if app:
+            d = os.path.join(app.user_data_dir, 'tex_cache')
+            os.makedirs(d, exist_ok=True)
+            return d
+    except Exception:
+        pass
+    d = os.path.join(os.path.expanduser('~'), '.neon_cache')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _pil_to_texture(img):
+    from kivy.graphics.texture import Texture
+    w, h = img.size
+    tex = Texture.create(size=(w, h), colorfmt='rgba')
+    tex.blit_buffer(img.tobytes(), colorfmt='rgba', bufferfmt='ubyte')
+    tex.flip_vertical()
+    return tex
+
+
+def _prepare_from_source(name, asset_dir):
+    """后台线程里用：解码 + 抠图 + 降采样。"""
+    img = PILImage.open(os.path.join(asset_dir, name + '.png'))
+    img.load()
+    img = img.convert('RGBA')
+    if _bg_is_black(img):
+        img = _clean_black_flood(img, threshold=40)
+    w, h = img.size
+    longest = max(w, h)
+    if longest > MAX_TEX_SIZE:
+        s = MAX_TEX_SIZE / longest
+        img = img.resize((max(1, int(w * s)), max(1, int(h * s))),
+                         PILImage.BILINEAR)
+    return img
+
+
 class GameWidget(Widget):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # 加载图片纹理
         self.textures = {}
-        for name in IMG_NAMES:
-            path = os.path.join(ASSET_DIR, name + '.png')
-            if os.path.exists(path):
-                try:
-                    self.textures[name] = CoreImage(path).texture
-                except Exception as e:
-                    print(f"[资源] {path} 加载失败：{e}")
-        missing = [k for k in IMG_NAMES if k not in self.textures]
-        if missing:
-            print(f"未找到图片，用矢量图形代替：{missing}")
+        self.assets_ready = False
+        self._load_progress = 0.0
+        self._cache_dir = _get_cache_dir()   # 主线程里取好，线程里直接用
 
         self.keys = set()
         self.touch_x = None
         self.S = 1.0
         self._inited = False
         self._text_cache = {}
+        self.pause_btn_rect = None
+
+        # 先占位，避免加载期间绘制访问到不存在的属性
+        self.stars = []
+        self.player = {'x': 0, 'y': 0, 'r': 12, 'cooldown': 0,
+                       'invuln': 0, 'shield': 0, 'triple': 0, 'lives': 3}
+        self.bullets = []
+        self.ebullets = []
+        self.enemies = []
+        self.particles = []
+        self.powerups = []
+        self.floats = []
+        self.boss = None
+        self.score = 0
+        self.wave = 0
+        self.shake = 0.0
+        self.state = 'loading'
+        self.ox = self.oy = 0.0
 
         Window.bind(on_key_down=self._on_kd, on_key_up=self._on_ku)
 
+        # 后台线程加载贴图（不阻塞 UI 线程）
+        threading.Thread(target=self._load_assets_bg, daemon=True).start()
+
         Clock.schedule_once(self._try_init, 0)
         Clock.schedule_interval(self._tick, 1 / 60)
-        self.pause_btn_rect = None
+
+    # ---------------- 后台贴图加载 ----------------
+    def _load_assets_bg(self):
+        prepared = {}
+        total = max(1, len(IMG_NAMES))
+
+        if not HAS_PIL:
+            Clock.schedule_once(lambda dt: self._on_assets_ready(prepared), 0)
+            return
+
+        for i, name in enumerate(IMG_NAMES):
+            src = os.path.join(ASSET_DIR, name + '.png')
+            if os.path.exists(src):
+                try:
+                    cache = os.path.join(self._cache_dir, f'{name}_{CACHE_VER}.png')
+                    if (os.path.exists(cache) and
+                            os.path.getmtime(cache) >= os.path.getmtime(src)):
+                        img = PILImage.open(cache)
+                        img.load()
+                        img = img.convert('RGBA')
+                    else:
+                        img = _prepare_from_source(name, ASSET_DIR)
+                        try:
+                            img.save(cache, 'PNG', compress_level=1)
+                        except Exception:
+                            pass
+                    prepared[name] = img
+                except Exception as e:
+                    print(f"[资源] 加载失败 {src}: {e}")
+            self._load_progress = (i + 1) / total
+
+        Clock.schedule_once(lambda dt: self._on_assets_ready(prepared), 0)
+
+    def _on_assets_ready(self, prepared):
+        # 主线程里创建纹理（需要 GL 上下文）
+        for name, img in prepared.items():
+            try:
+                self.textures[name] = _pil_to_texture(img)
+            except Exception as e:
+                print(f"[资源] 纹理创建失败 {name}: {e}")
+
+        # 没预处理成功的，退回原生加载
+        for name in IMG_NAMES:
+            if name in self.textures:
+                continue
+            src = os.path.join(ASSET_DIR, name + '.png')
+            if not os.path.exists(src):
+                continue
+            try:
+                self.textures[name] = CoreImage(src).texture
+            except Exception as e:
+                print(f"[资源] 原生加载失败 {src}: {e}")
+
+        missing = [k for k in IMG_NAMES if k not in self.textures]
+        if missing:
+            print(f"未找到图片，用矢量图形代替：{missing}")
+
+        self._load_progress = 1.0
+        self.assets_ready = True
 
     # ---------------- 初始化 ----------------
     def _try_init(self, dt):
-        if self.width < 10 or self.height < 10:
+        if self.width < 10 or self.height < 10 or not self.assets_ready:
             Clock.schedule_once(self._try_init, 0.05)
             return
         self.S = min(self.width / 1000.0, self.height / 720.0)
@@ -142,12 +336,14 @@ class GameWidget(Widget):
     }
 
     def _on_kd(self, win, key, *args):
-        if key in (112, 27):        # P / Esc 暂停
+        if not self._inited:
+            return
+        if key in (112, 27):
             if self.state == 'playing':
                 self.state = 'paused'
             elif self.state == 'paused':
                 self.state = 'playing'
-        elif key == 114:           # R 重开
+        elif key == 114:
             if self.state == 'over':
                 self.init_game()
         elif key in self.KEY_MAP:
@@ -158,11 +354,13 @@ class GameWidget(Widget):
             self.keys.discard(self.KEY_MAP[key])
 
     def on_touch_down(self, touch):
+        if not self._inited:
+            return True
+
         if self.state == 'over':
             self.init_game()
             return True
 
-        # 检测暂停按钮点击
         if self.pause_btn_rect:
             x, y, w, h = self.pause_btn_rect
             if x <= touch.x <= x + w and y <= touch.y <= y + h:
@@ -172,7 +370,6 @@ class GameWidget(Widget):
                     self.state = 'playing'
                 return True
 
-        # 暂停状态下点击任意位置恢复
         if self.state == 'paused':
             self.state = 'playing'
             return True
@@ -186,11 +383,12 @@ class GameWidget(Widget):
         return True
 
     def on_touch_up(self, touch):
-        return True   # 手指松开，飞船停在原位
+        return True
 
     # ---------------- 主循环 ----------------
     def _tick(self, dt):
         if not self._inited:
+            self._draw_loading()
             return
         self.update(dt)
         self.draw()
@@ -199,7 +397,6 @@ class GameWidget(Widget):
         S = self.S
         W, H = self.width, self.height
 
-        # 星空滚动
         for s in self.stars:
             s['y'] -= s['spd'] * dt
             if s['y'] < 0:
@@ -228,7 +425,6 @@ class GameWidget(Widget):
             self.wave_timer = 0
             self.wave += 1
 
-        # 每 5 波出现 BOSS
         if (self.wave + 1) % 5 == 0 and self.boss is None and self.wave not in self.boss_waves:
             self.spawn_boss()
             self.boss_waves.add(self.wave)
@@ -263,7 +459,6 @@ class GameWidget(Widget):
         if 'down' in self.keys or 's' in self.keys:
             dy -= 1
 
-        # 触屏优先：水平跟随手指
         if self.touch_x is not None:
             target = max(p['r'] + 8, min(W - p['r'] - 8, self.touch_x))
             p['x'] += (target - p['x']) * min(1.0, dt * 18)
@@ -278,7 +473,6 @@ class GameWidget(Widget):
         p['x'] = max(r + 8, min(W - r - 8, p['x']))
         p['y'] = max(r + 8, min(H - r - 8, p['y']))
 
-        # 引擎尾焰
         if random.random() < 0.7:
             self.particles.append({
                 'x': p['x'] + random.uniform(-3, 3) * S,
@@ -290,7 +484,6 @@ class GameWidget(Widget):
                 'size': random.uniform(1.2, 2.6) * S,
             })
 
-        # 自动开火
         p['cooldown'] -= dt
         if p['cooldown'] <= 0:
             p['cooldown'] = 0.11
@@ -497,7 +690,6 @@ class GameWidget(Widget):
                 b['entering'] = False
             return
 
-        # 入场后高度锁定，只左右移动
         b['y'] = H - 150 * S
         b['x'] += b['vx'] * dt
         if b['x'] - b['r'] < 20 * S:
@@ -702,6 +894,36 @@ class GameWidget(Widget):
             self.burst(x, y, '#ff3366', 14)
 
     # ---------------- 绘制 ----------------
+    def _draw_loading(self):
+        W, H = self.width, self.height
+        if W < 10 or H < 10:
+            return
+        self.canvas.clear()
+        with self.canvas:
+            Color(*hex_rgba('#050510'))
+            Rectangle(pos=(0, 0), size=(W, H))
+
+            bar_w = min(W * 0.55, 420.0)
+            bar_h = max(6.0, H * 0.014)
+            bx = W / 2 - bar_w / 2
+            by = H / 2 - bar_h / 2
+
+            Color(*hex_rgba('#1b2030'))
+            Rectangle(pos=(bx, by), size=(bar_w, bar_h))
+            Color(*hex_rgba('#5ee8ff'))
+            Rectangle(pos=(bx, by),
+                      size=(bar_w * max(0.03, self._load_progress), bar_h))
+
+    def _draw_tex(self, tex, x, y, target_size):
+        tw, th = tex.size
+        if tw <= 0 or th <= 0:
+            return
+        scale = target_size / max(tw, th)
+        w = tw * scale
+        h = th * scale
+        Color(1, 1, 1, 1)
+        Rectangle(texture=tex, pos=(x - w / 2, y - h / 2), size=(w, h))
+
     def _text_tex(self, text, color, size):
         key = (text, color, size)
         if key in self._text_cache:
@@ -741,7 +963,6 @@ class GameWidget(Widget):
             Color(*hex_rgba('#050510'))
             Rectangle(pos=(0, 0), size=(W, H))
 
-            # 星空
             for s in self.stars:
                 b = s['b']
                 Color(120 * b / 255, 180 * b / 255, 255 * b / 255, 1)
@@ -803,10 +1024,7 @@ class GameWidget(Widget):
 
             tex = self.textures.get(e.get('img', ''))
             if tex:
-                Color(1, 1, 1, 1)
-                Rectangle(texture=tex,
-                          pos=(x - tex.width / 2, y - tex.height / 2),
-                          size=(tex.width, tex.height))
+                self._draw_tex(tex, x, y, r * 4.0)
             else:
                 col = hex_rgba(e['color'])
                 if e['flash'] > 0:
@@ -837,10 +1055,7 @@ class GameWidget(Widget):
 
         tex = self.textures.get('boss')
         if tex:
-            Color(1, 1, 1, 1)
-            Rectangle(texture=tex,
-                      pos=(x - tex.width / 2, y - tex.height / 2),
-                      size=(tex.width, tex.height))
+            self._draw_tex(tex, x, y, r * 2.2)
         else:
             pts = poly_pts(x, y, r, 6, rot=0)
             Color(*hex_rgba('#a06bff'))
@@ -870,10 +1085,7 @@ class GameWidget(Widget):
 
         tex = self.textures.get('player')
         if tex:
-            Color(1, 1, 1, 1)
-            Rectangle(texture=tex,
-                      pos=(x - tex.width / 2, y - tex.height / 2),
-                      size=(tex.width, tex.height))
+            self._draw_tex(tex, x, y, r * 5.0)
         else:
             pts = [x, y + r * 1.4,
                    x - r * 0.9, y - r * 0.9,
@@ -893,10 +1105,7 @@ class GameWidget(Widget):
             y = u['y'] + self.oy
             tex = self.textures.get(imap[u['kind']])
             if tex:
-                Color(1, 1, 1, 1)
-                Rectangle(texture=tex,
-                          pos=(x - tex.width / 2, y - tex.height / 2),
-                          size=(tex.width, tex.height))
+                self._draw_tex(tex, x, y, 40 * S)
             else:
                 Color(*hex_rgba(cmap[u['kind']]))
                 Ellipse(pos=(x - 15 * S, y - 15 * S), size=(30 * S, 30 * S))
@@ -905,7 +1114,6 @@ class GameWidget(Widget):
 
     def _draw_floats(self):
         for f in self.floats:
-            t = max(0.0, min(1.0, f['life'] / 0.9))
             self._draw_text(f['text'], f['x'] + self.ox,
                             f['y'] + self.oy, f['color'],
                             int(15 * self.S) or 12, 'center')
@@ -914,22 +1122,28 @@ class GameWidget(Widget):
         S = self.S
         W, H = self.width, self.height
 
+        # 暂停按钮（右上角）—— 修正原先 -800*S 的坐标 bug
+        btn_size = 40 * S
+        btn_x = W - btn_size - 12 * S
+        btn_y = H - btn_size - 12 * S
+        self.pause_btn_rect = (btn_x, btn_y, btn_size, btn_size)
+
         self._draw_text(f"SCORE {self.score}", 20 * S, H - 30 * S,
                         '#e8f4ff', int(20 * S) or 14, 'left')
         self._draw_text(f"WAVE {self.wave + 1}", W / 2, H - 28 * S,
                         '#ffd23f', int(18 * S) or 13, 'center')
 
-        # 生命：右上角三角形
+        # 生命：放到暂停按钮下方，避免重叠
         for i in range(self.player['lives']):
-            cx = W - 32 * S - i * 26 * S
-            cy = H - 32 * S
+            cx = W - 30 * S - i * 26 * S
+            cy = H - btn_size - 34 * S
             pts = poly_pts(cx, cy, 11 * S, 3, rot=-math.pi / 2)
             Color(*hex_rgba('#ff3366'))
             Line(points=pts, close=True, width=2)
 
         if self.player['triple'] > 0:
             self._draw_text(f"TRIPLE {self.player['triple']:.1f}s",
-                            W - 28 * S, H - 62 * S,
+                            W - 28 * S, H - btn_size - 62 * S,
                             '#ffd23f', int(14 * S) or 11, 'right')
 
         if self.boss and not self.boss['entering']:
@@ -962,29 +1176,25 @@ class GameWidget(Widget):
                             '#ffffff', int(24 * S) or 16, 'center')
             self._draw_text("TAP TO RESTART", W / 2, H / 2 - 60 * S,
                             '#5ee8ff', int(18 * S) or 13, 'center')
-        # 绘制暂停按钮（右上角）
-        btn_size = 40 * S
-        btn_x = W - btn_size - 800 * S
-        btn_y = H - btn_size - 10 * S
-        self.pause_btn_rect = (btn_x, btn_y, btn_size, btn_size)
 
+        # 暂停 / 继续图标
         Color(*hex_rgba('#2a2a3a'))
         Rectangle(pos=(btn_x, btn_y), size=(btn_size, btn_size))
         Color(*hex_rgba('#5ee8ff'))
         Line(rectangle=(btn_x, btn_y, btn_size, btn_size), width=2)
 
         if self.state == 'playing':
-            # 暂停图标：两条竖线
             bar_w = btn_size * 0.2
             bar_h = btn_size * 0.5
             Color(*hex_rgba('#5ee8ff'))
-            Rectangle(pos=(btn_x + btn_size*0.3, btn_y + btn_size*0.25), size=(bar_w, bar_h))
-            Rectangle(pos=(btn_x + btn_size*0.5, btn_y + btn_size*0.25), size=(bar_w, bar_h))
+            Rectangle(pos=(btn_x + btn_size * 0.3, btn_y + btn_size * 0.25),
+                      size=(bar_w, bar_h))
+            Rectangle(pos=(btn_x + btn_size * 0.5, btn_y + btn_size * 0.25),
+                      size=(bar_w, bar_h))
         else:
-            # 播放图标：三角形
-            pts = [btn_x + btn_size*0.35, btn_y + btn_size*0.25,
-                   btn_x + btn_size*0.35, btn_y + btn_size*0.75,
-                   btn_x + btn_size*0.7, btn_y + btn_size*0.5]
+            pts = [btn_x + btn_size * 0.35, btn_y + btn_size * 0.25,
+                   btn_x + btn_size * 0.35, btn_y + btn_size * 0.75,
+                   btn_x + btn_size * 0.7, btn_y + btn_size * 0.5]
             Color(*hex_rgba('#5ee8ff'))
             Line(points=pts, close=True, width=2)
 
@@ -997,13 +1207,11 @@ class NeonApp(App):
         return self.game
 
     def on_pause(self):
-        # 进入后台时暂停游戏
-        if self.game.state == 'playing':
+        if self.game._inited and self.game.state == 'playing':
             self.game.state = 'paused'
-        return True  # 允许应用暂停
+        return True
 
     def on_resume(self):
-        # 回到前台，保持暂停，用户点击后继续
         pass
 
 

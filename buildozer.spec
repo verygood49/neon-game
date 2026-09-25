@@ -8,9 +8,9 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.include_patterns = assets/*.png, assets/fonts/*.ttf
 
-version = 1.0
+version = 1.5
 
-requirements = python3,kivy==2.3.1,filetype
+requirements = python3,kivy==2.3.1,filetype,pillow,numpy
 
 p4a.branch = v2024.01.21
 
